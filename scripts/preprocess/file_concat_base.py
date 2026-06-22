@@ -1,8 +1,9 @@
 import os
+import sys
 
-LANG = "ja"
+LANG = sys.argv[1] if len(sys.argv) > 1 else "en"
 
-ALL_LANGS = ["de", "en", "es", "fr", "it", "ja", "pt", "ru", "zh"]
+ALL_LANGS = [LANG]
 
 # Directory paths
 INPUT_BASE_DIR = os.path.join("auto_align")

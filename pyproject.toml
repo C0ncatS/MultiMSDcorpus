@@ -1,0 +1,14 @@
+[project]
+name = "multimsdcorpus"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "ja-sentence-segmenter==0.0.2",
+    "playwright==1.52.0",
+    "scikit-learn>=1.9.0",
+    "sentence-transformers==4.1.0",
+    "stanza==1.8.2",
+]

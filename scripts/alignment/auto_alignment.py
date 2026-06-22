@@ -62,7 +62,7 @@ def align_section(section_num, pro_filenames):
         auto_align(pro_filename, section_num)
 
 def main():
-    for section_num in range(1, 25):
+    for section_num in range(1, 30):
         pro_files_dir = cleaned_pro_dir + str(section_num)
         if not os.path.isdir(pro_files_dir):
             continue

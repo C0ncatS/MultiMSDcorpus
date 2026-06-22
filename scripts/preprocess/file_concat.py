@@ -6,7 +6,7 @@ lang = sys.argv[1]
 # Directory paths
 INPUT_BASE_DIR = os.path.join("auto_align", lang, "aligned_data")
 OUTPUT_BASE_DIR = os.path.join("auto_align", lang, "splitted_data")
-DEV_TEST_LIST_DIR = os.path.join("auto_align", "ja", "splitted_data")
+DEV_TEST_LIST_DIR = os.path.join("auto_align", "en", "splitted_data")
 
 def split_and_concat_files(section_num: int, article_dir_names: list, dev_files: list, test_files: list):
     for article_dir in article_dir_names:

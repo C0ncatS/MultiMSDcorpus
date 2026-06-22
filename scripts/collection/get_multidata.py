@@ -1,186 +1,222 @@
-import urllib.request
-import urllib.parse
-from bs4 import BeautifulSoup
-import re
+import json
 import os
+import re
 import time
-from playwright.sync_api import sync_playwright, TimeoutError, Page
+import urllib.parse
+import urllib.request
+
+from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.msdmanuals.com"
-TOPICS_URL = f"{BASE_URL}/professional/health-topics"
+PRO_TOPICS_URL = f"{BASE_URL}/professional/health-topics"
+HOME_TOPICS_URL = f"{BASE_URL}/home/health-topics"
 
 OUTPUT_DIR = "raw_data"
+ALL_LANGS = ["en"]
 
-LANG_LIST = ["de", "en", "es", "fr", "it", "pt", "ru", "zh"]
-ALL_LANGS = ["ja"] + LANG_LIST
-
-# Mapping from the visible text in the language dropdown menu to language codes
-# This is used by Playwright to find and click the correct language link.
-# Excludes English (base language) and Chinese (handled with a special rule).
-LANG_TEXT_MAP = {
-    "日本語 (JAPANESE)": "ja",
-    "DEUTSCH (GERMAN)": "de",
-    "ESPAÑOL (SPANISH)": "es",
-    "FRANÇAIS (FRENCH)": "fr",
-    "ITALIANO (ITALIAN)": "it",
-    "PORTUGUÊS (PORTUGUESE)": "pt",
-    "РУССКИЙ (RUSSIAN)": "ru",
-}
-
-# Finds the 'relatedLinks' in the page source to get the consumer (amateur) version URL.
-RE_RELATED_LINKS = re.compile(r'"relatedLinks":\["(.*?)"\]')
-# Extracts topic URLs from the __NEXT_DATA__ script tag on section pages.
 RE_TOPIC_URL = re.compile(r'"TopicUrl":{"path":"(.*?)"}')
+PRO_TEXT_SELECTOR = (
+    "span[class*=TopicHead_content], span[class*=TopicFHead], span[class*=TopicHHead], "
+    "span[class*=TopicGHead], span.TopicPara_topicText__CUB0d, span.TopicXLink_formatText__5UPAp, "
+    "span[class*=TopicPara], span[class*=topicText], a[class*=professional]"
+)
+HOME_TEXT_SELECTOR = (
+    "span[class*=TopicHead_content], span[class*=TopicFHead], span[class*=TopicHHead], "
+    "span[class*=TopicGHead], span.TopicPara_topicText__CUB0d, span.TopicXLink_formatText__5UPAp, "
+    "span[class*=TopicPara], span[class*=topicText], a[class*=home]"
+)
+
+# MSD reference blocks use section headings like "General references" or
+# "Immune response references". Match the heading title only, not body text.
+REFERENCE_SECTION_TITLE_RE = re.compile(
+    r"^references$|^general\s+references$|^.+\s+references$",
+    re.IGNORECASE,
+)
 
 
-def get_data(section_index: int, topic_index: int, pro_soup: BeautifulSoup, ama_soup: BeautifulSoup, lang: str):
-    # --- Process the Professional version page ---
+def encode_url(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    path = urllib.parse.quote(parts.path, safe="/%")
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, path, parts.query, parts.fragment)
+    )
+
+
+def fetch_url(url: str) -> bytes:
+    request = urllib.request.Request(
+        encode_url(url),
+        headers={"User-Agent": "Mozilla/5.0 (compatible; MultiMSDcorpus/1.0)"},
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read()
+
+
+def get_next_data(url: str) -> dict:
+    soup = BeautifulSoup(fetch_url(url), "html.parser")
+    script_tag = soup.select_one('script[id="__NEXT_DATA__"]')
+    if script_tag is None or not script_tag.string:
+        raise ValueError(f"No __NEXT_DATA__ found at {url}")
+    return json.loads(script_tag.string)
+
+
+def get_health_sections(url: str) -> list[dict]:
+    data = get_next_data(url)
+    for component in data["props"]["pageProps"]["componentProps"].values():
+        if not isinstance(component, dict):
+            continue
+        items = component.get("data")
+        if isinstance(items, list) and len(items) >= 20:
+            return items
+    return []
+
+
+def get_topic_paths(section_path: str) -> list[str]:
+    page_bytes = fetch_url(f"{BASE_URL}{section_path}")
+    return RE_TOPIC_URL.findall(page_bytes.decode("utf-8"))
+
+
+def topic_slug(path: str) -> str:
+    return path.strip("/").split("/")[-1]
+
+
+def build_home_topic_index(home_sections: list[dict]) -> dict[str, str]:
+    home_by_slug: dict[str, str] = {}
+    for section in home_sections:
+        for path in get_topic_paths(section["relativeurlcomputed_s"]):
+            slug = topic_slug(path)
+            if slug not in home_by_slug:
+                home_by_slug[slug] = path
+    return home_by_slug
+
+
+def match_consumer_path(pro_path: str, home_by_slug: dict[str, str]) -> str | None:
+    return home_by_slug.get(topic_slug(pro_path))
+
+
+def remove_reference_sections(soup: BeautifulSoup) -> None:
+    for section in soup.select("section[class*=TopicGHead_topicGHeadSection]"):
+        header = section.select_one("h2, h3")
+        if header is None:
+            continue
+        title = header.get_text(strip=True)
+        if REFERENCE_SECTION_TITLE_RE.match(title):
+            section.decompose()
+
+
+def extract_text(soup: BeautifulSoup, selector: str) -> list[str]:
+    lines = []
     previous_line = ""
-    # Remove unwanted elements like lists, section heads, and tables to clean the text.
-    for ul in pro_soup.find_all('ul'): ul.decompose()
-    for ol in pro_soup.find_all('ol'): ol.decompose()
-    for sec in pro_soup.find_all(class_='TopicFHead_topicFHeadTitle__pl6da'): sec.decompose()
-    for table in pro_soup.find_all('div', {'data-testid': 'baseillustrative', 'class': 'undefined professional false false'}): table.decompose()
-    
-    # Select only the desired text-containing elements.
-    elements = pro_soup.select('span.TopicPara_topicText__CUB0d, span.TopicXLink_formatText__5UPAp, a[class*=professional]')
-
-    pro_filepath = os.path.join(OUTPUT_DIR, lang, "professional", f"section{section_index+1}", f"{section_index+1}-{topic_index+1}.pro")
-    with open(pro_filepath, "w", encoding="utf-8") as output_file:
-        for element in elements:
-            element_str = element.decode()
-            text_data = re.sub("<.+?>", "", element_str).strip()
-            if text_data and text_data != previous_line:
-                output_file.write(text_data+"\n")
-                previous_line = text_data
-
-    # --- Process the Consumer (amateur) version page ---
-    previous_line = ""
-    for ul in ama_soup.find_all('ul'): ul.decompose()
-    for ol in ama_soup.find_all('ol'): ol.decompose()
-    for sec in ama_soup.find_all(class_='TopicFHead_topicFHeadTitle__pl6da'): sec.decompose()
-    for table in ama_soup.find_all('div', {'data-testid': 'baseillustrative', 'class': 'undefined consumer false false'}): table.decompose()
-    
-    elements = ama_soup.select('span.TopicPara_topicText__CUB0d, span.TopicXLink_formatText__5UPAp, a[class*=home]')
-    
-    ama_filepath = os.path.join(OUTPUT_DIR, lang, "amateur", f"section{section_index+1}", f"{section_index+1}-{topic_index+1}.ama")
-    with open(ama_filepath, "w", encoding="utf-8") as output_file:
-        for element in elements:
-            element_str = element.decode()
-            text_data = re.sub("<.+?>", "", element_str).strip()
-            if text_data and text_data != previous_line:
-                output_file.write(text_data+"\n")
-                previous_line = text_data
+    for element in soup.select(selector):
+        text_data = element.get_text(strip=True)
+        if text_data and text_data != previous_line:
+            lines.append(text_data)
+            previous_line = text_data
+    return lines
 
 
-def get_all_language_urls(page: Page, start_en_url: str):
-    found_urls = {"en": start_en_url}
-    try:
-        # Manually construct the Chinese URL since it uses a different TLD (.cn)
-        found_urls['zh'] = start_en_url.replace(".com/", ".cn/", 1)
-
-        # Use Playwright to find the URLs for all other languages.
-        for lang_text, lang_code in LANG_TEXT_MAP.items():
-            try:
-                page.goto(start_en_url, wait_until='networkidle', timeout=60000)
-                try:
-                    page.click("#onetrust-accept-btn-handler", timeout=3000)
-                    time.sleep(1)
-                except TimeoutError:
-                    pass
-                
-                page.click('#langswitcherDropdown', timeout=15000)
-                with page.expect_navigation(wait_until="networkidle", timeout=60000):
-                    page.get_by_text(lang_text, exact=True).click(timeout=10000)
-                
-                found_urls[lang_code] = page.url
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return found_urls
+def write_lines(filepath: str, lines: list[str]) -> None:
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as output_file:
+        for line in lines:
+            output_file.write(line + "\n")
 
 
-def jump_ama_page(page: Page, section_index: int, topic_index: int, topic_path: str):
-    en_pro_url = f"{BASE_URL}{topic_path}"
+def get_data(
+    section_index: int,
+    topic_index: int,
+    pro_path: str,
+    home_path: str,
+    lang: str,
+) -> None:
+    pro_soup = BeautifulSoup(fetch_url(f"{BASE_URL}{pro_path}"), "html.parser")
+    home_soup = BeautifulSoup(fetch_url(f"{BASE_URL}{home_path}"), "html.parser")
+    remove_reference_sections(pro_soup)
+    remove_reference_sections(home_soup)
 
-    # Get the list of all language URLs using Playwright.
-    all_lang_urls = get_all_language_urls(page, en_pro_url)
-    if not all_lang_urls:
+    section_name = f"section{section_index + 1}"
+    file_stem = f"{section_index + 1}-{topic_index + 1}"
+    pro_filepath = os.path.join(
+        OUTPUT_DIR, lang, "professional", section_name, f"{file_stem}.pro"
+    )
+    home_filepath = os.path.join(
+        OUTPUT_DIR, lang, "amateur", section_name, f"{file_stem}.ama"
+    )
+
+    pro_lines = extract_text(pro_soup, PRO_TEXT_SELECTOR)
+    home_lines = extract_text(home_soup, HOME_TEXT_SELECTOR)
+    if not pro_lines or not home_lines:
         return
 
-    # Scrape the professional/consumer page pair for each language found.
-    for lang, pro_url in all_lang_urls.items():
-        try:
-            lang_pro_bytes = urllib.request.urlopen(pro_url).read()
-            lang_pro_soup = BeautifulSoup(lang_pro_bytes, "html.parser")
+    write_lines(pro_filepath, pro_lines)
+    write_lines(home_filepath, home_lines)
 
-            lang_ama_urls = RE_RELATED_LINKS.findall(lang_pro_soup.decode())
-            if not lang_ama_urls:
-                continue
-            
-            lang_ama_url = lang_ama_urls[0].replace("localhost", "msdmanuals.com")
-            if lang == 'zh':
-                lang_ama_url = lang_ama_url.replace(".com/", ".cn/", 1)
-            
-            lang_ama_url_encoded = urllib.parse.quote(lang_ama_url, safe=':/')
-            
-            lang_ama_bytes = urllib.request.urlopen(lang_ama_url_encoded).read()
-            lang_ama_soup = BeautifulSoup(lang_ama_bytes, "html.parser")
 
-            if RE_RELATED_LINKS.search(lang_ama_soup.decode()):
-                get_data(section_index, topic_index, lang_pro_soup, lang_ama_soup, lang)
-        except Exception:
+def scrape_section(
+    section_index: int,
+    pro_section_path: str,
+    home_by_slug: dict[str, str],
+) -> int:
+    pro_topics = get_topic_paths(pro_section_path)
+    saved = 0
+
+    for topic_index, pro_path in enumerate(pro_topics):
+        home_path = match_consumer_path(pro_path, home_by_slug)
+        if not home_path:
             continue
-        
-        time.sleep(1)
+        try:
+            get_data(section_index, topic_index, pro_path, home_path, "en")
+            saved += 1
+        except Exception as exc:
+            print(f"section {section_index + 1} topic {topic_index + 1}: {exc}")
+            continue
+        time.sleep(0.5)
 
-
-def jump_column(page: Page, section_index: int, section_path: str):
-    # Get the HTML of the main section page.
-    content_bytes = urllib.request.urlopen(f"{BASE_URL}{section_path}").read()
-    soup = BeautifulSoup(content_bytes, "html.parser")
-
-    # Extract all topic URLs contained within that section.
-    script_tag = soup.select_one('script[id="__NEXT_DATA__"]')
-    topic_paths = RE_TOPIC_URL.findall(script_tag.decode())
-    
-    for topic_index, path in enumerate(topic_paths):
-        jump_ama_page(page, section_index, topic_index, path)
+    return saved
 
 
 def main():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    pro_sections = get_health_sections(PRO_TOPICS_URL)
+    home_sections = get_health_sections(HOME_TOPICS_URL)
+    if not pro_sections:
+        raise RuntimeError(
+            "No professional sections found. The MSD Manuals page structure may have changed again."
         )
-        page = context.new_page()
+    if not home_sections:
+        raise RuntimeError(
+            "No consumer sections found. The MSD Manuals page structure may have changed again."
+        )
 
-        try:
-            content_bytes = urllib.request.urlopen(TOPICS_URL).read()
-            soup = BeautifulSoup(content_bytes, "html.parser")
-        except Exception:
-            browser.close()
-            return
-        
-        section_links = soup.select('.SectionList_sectionListItem__NNP4c')
-        
-        for section_index, link_tag in enumerate(section_links):
-            try:
-                for lang in ALL_LANGS:
-                    os.makedirs(os.path.join(OUTPUT_DIR, lang, "professional", f"section{section_index+1}"), exist_ok=True)
-                    os.makedirs(os.path.join(OUTPUT_DIR, lang, "amateur", f"section{section_index+1}"), exist_ok=True)            
-                
-                section_path_tag = link_tag.select_one('a[href]')
-                if section_path_tag:
-                    section_path = section_path_tag.get('href')
-                    jump_column(page, section_index, section_path)
-            except Exception:
-                continue
-        
-        browser.close()
+    section_count = len(pro_sections)
+    print(f"Found {section_count} professional sections to scrape.")
+    print("Building consumer topic index...")
+    home_by_slug = build_home_topic_index(home_sections)
+    print(f"Indexed {len(home_by_slug)} consumer topics.")
+
+    total_saved = 0
+    for section_index in range(section_count):
+        pro_section_path = pro_sections[section_index]["relativeurlcomputed_s"]
+        for lang in ALL_LANGS:
+            os.makedirs(
+                os.path.join(OUTPUT_DIR, lang, "professional", f"section{section_index + 1}"),
+                exist_ok=True,
+            )
+            os.makedirs(
+                os.path.join(OUTPUT_DIR, lang, "amateur", f"section{section_index + 1}"),
+                exist_ok=True,
+            )
+
+        print(
+            f"section {section_index + 1}: "
+            f"{pro_sections[section_index].get('titlecomputed_t', '?')}"
+        )
+        saved = scrape_section(section_index, pro_section_path, home_by_slug)
+        print(f"  saved {saved} article pairs")
+        total_saved += saved
+
+    if total_saved == 0:
+        raise RuntimeError("Scraping finished but no article pairs were saved.")
+    print(f"Saved {total_saved} professional/consumer article pairs.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -1,12 +1,6 @@
-python3 scripts/preprocess/file_concat_base.py ja
-for lang in de en es fr it pt ru zh;
-do
-    python3 scripts/preprocess/file_concat.py $lang
-done
+python3 scripts/preprocess/file_concat_base.py en
+python3 scripts/preprocess/file_concat.py en
 
-for lang in de en es fr it ja pt ru zh;
-do
-    python3 scripts/preprocess/preprocess.py $lang train
-    python3 scripts/preprocess/preprocess.py $lang dev
-    python3 scripts/preprocess/preprocess.py $lang test
-done
+python3 scripts/preprocess/preprocess.py en train
+python3 scripts/preprocess/preprocess.py en dev
+python3 scripts/preprocess/preprocess.py en test

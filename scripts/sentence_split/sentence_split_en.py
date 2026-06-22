@@ -6,7 +6,8 @@ DATA_DIR = "raw_data/en"
 CLEANED_DIR = "cleaned_data/en"
 
 stanza.download('en')
-segmenter = stanza.Pipeline('en')
+# Tokenize-only pipeline avoids loading POS pretrain embeddings (broken with PyTorch 2.6+ weights_only default).
+segmenter = stanza.Pipeline('en', processors='tokenize', download_method=stanza.DownloadMethod.REUSE_RESOURCES)
 
 def _process_and_write(input_file, output_file):
     text = ""
@@ -40,10 +41,13 @@ def sentence_split(section, pro_files, ama_files):
 def main():
    pro_base_dir = f"{DATA_DIR}/professional/section"
    ama_base_dir = f"{DATA_DIR}/amateur/section"
-   for section in range(1, 25):
+   for section in range(1, 30):
+        section_dir = pro_base_dir + str(section)
+        if not os.path.isdir(section_dir):
+            continue
         os.makedirs(f"{CLEANED_DIR}/professional/section{section}", exist_ok=True)
         os.makedirs(f"{CLEANED_DIR}/amateur/section{section}", exist_ok=True)
-        pro_files = sorted([f for f in os.listdir(pro_base_dir + str(section)) if os.path.isfile(os.path.join(pro_base_dir + str(section), f))])
+        pro_files = sorted([f for f in os.listdir(section_dir) if os.path.isfile(os.path.join(section_dir, f))])
         ama_files = sorted([f for f in os.listdir(ama_base_dir + str(section)) if os.path.isfile(os.path.join(ama_base_dir + str(section), f))])
         print("section"+ str(section) + "：" + str(len(pro_files)))
         sentence_split(section, pro_files, ama_files)
