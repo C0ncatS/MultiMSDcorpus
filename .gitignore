@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Data
+raw_data/
+cleaned_data/
+auto_align/
+results/
