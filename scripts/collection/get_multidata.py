@@ -1,7 +1,9 @@
+import http.client
 import json
 import os
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -54,6 +56,12 @@ REFERENCE_SECTION_TITLE_RE = re.compile(
 # Inline footnote bibliographies under a section, e.g. "Etiology reference".
 INLINE_REFERENCE_SUBSECTION_TITLE_RE = re.compile(r"^.+\s+reference$", re.IGNORECASE)
 DID_YOU_KNOW_TITLE_RE = re.compile(r"^did you know", re.IGNORECASE)
+EXCLUDED_SUBSECTION_TITLE_RES = (
+    re.compile(r"^physical examination\b", re.IGNORECASE),
+    re.compile(r"^interpretation of findings\b", re.IGNORECASE),
+    re.compile(r"^staging\b", re.IGNORECASE),
+    re.compile(r"^screening\b", re.IGNORECASE),
+)
 
 # Markdown-style prefixes so sentence split can keep headers on their own lines.
 PAGE_TITLE_PREFIX = "# "
@@ -62,6 +70,25 @@ SUBSECTION_TITLE_PREFIX = "### "
 MARKDOWN_TABLE_PLACEHOLDER_CLASS = "MultiMSD-md-table"
 MARKDOWN_LIST_PLACEHOLDER_CLASS = "MultiMSD-md-list"
 LIST_SELECTOR = "ul[class*=TopicList], ol[class*=TopicList]"
+
+# MSD returns abbreviated topic HTML unless the request looks like a normal browser fetch.
+FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+FETCH_MAX_RETRIES = 4
+FETCH_RETRY_BACKOFF_SEC = 2.0
+FETCH_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+FETCH_TIMEOUT_SEC = 120
+
+
+def is_excluded_subsection_title(title: str) -> bool:
+    stripped = title.strip()
+    return any(pattern.match(stripped) for pattern in EXCLUDED_SUBSECTION_TITLE_RES)
 
 
 def encode_url(url: str) -> str:
@@ -73,12 +100,35 @@ def encode_url(url: str) -> str:
 
 
 def fetch_url(url: str) -> bytes:
-    request = urllib.request.Request(
-        encode_url(url),
-        headers={"User-Agent": "Mozilla/5.0 (compatible; MultiMSDcorpus/1.0)"},
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return response.read()
+    encoded = encode_url(url)
+    last_error: Exception | None = None
+
+    for attempt in range(FETCH_MAX_RETRIES):
+        try:
+            request = urllib.request.Request(encoded, headers=FETCH_HEADERS)
+            with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_SEC) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code not in FETCH_RETRYABLE_HTTP_CODES:
+                raise
+        except (
+            http.client.IncompleteRead,
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionResetError,
+            OSError,
+        ) as exc:
+            last_error = exc
+
+        if attempt < FETCH_MAX_RETRIES - 1:
+            delay = FETCH_RETRY_BACKOFF_SEC * (2**attempt)
+            print(f"  fetch retry {attempt + 2}/{FETCH_MAX_RETRIES} for {url} in {delay:.0f}s")
+            time.sleep(delay)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Failed to fetch {url}")
 
 
 def get_next_data(url: str) -> dict:
@@ -196,6 +246,14 @@ def table_title(table) -> str:
         if title:
             return title
 
+    base_table_view = table.find_parent("div", attrs={"data-testid": "BaseTableView"})
+    if base_table_view is not None:
+        header = base_table_view.select_one("h3[class*=TableHeader]")
+        if header is not None:
+            title = header.get_text(" ", strip=True)
+            if title:
+                return title
+
     wrap = table.find_parent(
         "div",
         class_=lambda class_names: bool(
@@ -208,6 +266,61 @@ def table_title(table) -> str:
         if previous is not None:
             return previous.get_text(" ", strip=True)
     return ""
+
+
+def has_ancestor_class(element, class_substring: str) -> bool:
+    for parent in element.parents:
+        if not getattr(parent, "get", None):
+            continue
+        if any(class_substring in class_name for class_name in parent.get("class", [])):
+            return True
+    return False
+
+
+def is_callout_table(table) -> bool:
+    """MSD uses table markup for styled callout boxes, not only for data grids."""
+    if is_did_you_know_table(table):
+        return False
+
+    if has_ancestor_class(table, "TopicFigures"):
+        return True
+
+    rows = table.select("tr")
+    if len(rows) > 2:
+        return False
+
+    cells = table.select("td, th")
+    if not cells:
+        return False
+
+    text_lengths = [len(cell.get_text(" ", strip=True)) for cell in cells]
+    narrative_cells = [
+        cell
+        for cell in cells
+        if cell.select("p[data-testid=topicPara]") and len(cell.get_text(" ", strip=True)) > 200
+    ]
+    if not narrative_cells:
+        return False
+
+    long_cells = sum(1 for length in text_lengths if length > 200)
+    return long_cells == 1 and len(rows) <= 2
+
+
+def callout_table_to_lines(table) -> list[str]:
+    lines: list[str] = []
+    title = table_title(table)
+    if title and DID_YOU_KNOW_TITLE_RE.match(title.strip()):
+        return []
+    if title and is_excluded_subsection_title(title):
+        return []
+    if title:
+        lines.append(f"{SUBSECTION_TITLE_PREFIX}{title}")
+
+    for paragraph in table.select("p[data-testid=topicPara]"):
+        text = re.sub(r"\s+", " ", paragraph.get_text(" ", strip=True))
+        if text:
+            lines.append(text)
+    return lines
 
 
 def table_to_markdown_lines(table) -> list[str]:
@@ -232,6 +345,8 @@ def table_to_markdown_lines(table) -> list[str]:
     title = table_title(table)
     if title and DID_YOU_KNOW_TITLE_RE.match(title.strip()):
         return []
+    if title and is_excluded_subsection_title(title):
+        return []
     if title:
         lines.append(f"{SUBSECTION_TITLE_PREFIX}{title}")
 
@@ -247,7 +362,11 @@ def make_markdown_table_placeholder(table) -> BeautifulSoup:
     placeholder_soup = BeautifulSoup("", "html.parser")
     placeholder = placeholder_soup.new_tag("div")
     placeholder["class"] = [MARKDOWN_TABLE_PLACEHOLDER_CLASS]
-    placeholder["data-md"] = "\n".join(table_to_markdown_lines(table))
+    if is_callout_table(table):
+        md_lines = callout_table_to_lines(table)
+    else:
+        md_lines = table_to_markdown_lines(table)
+    placeholder["data-md"] = "\n".join(md_lines)
     return placeholder
 
 
@@ -295,6 +414,17 @@ def is_nested_topic_list(list_element) -> bool:
     return any("TopicList" in class_name for class_name in parent_list.get("class", []))
 
 
+def callout_table_container(table):
+    for parent in table.parents:
+        if not getattr(parent, "get", None):
+            continue
+        if any("TopicFigures" in class_name for class_name in parent.get("class", [])):
+            return parent
+        if parent.get("data-testid") == "BaseTableView":
+            return parent
+    return table
+
+
 def is_did_you_know_table(table) -> bool:
     class_names = " ".join(table.get("class", []))
     if "didYouKnow" in class_names:
@@ -314,9 +444,18 @@ def inject_markdown_table_placeholders(nodes) -> None:
                 continue
             popup.replace_with(make_markdown_table_placeholder(table))
 
+        replaced_callouts: set[int] = set()
         for table in list(node.select("table[class*=TopicTableView]")):
             if is_did_you_know_table(table):
                 table.decompose()
+                continue
+            if is_callout_table(table):
+                container = callout_table_container(table)
+                container_id = id(container)
+                if container_id in replaced_callouts:
+                    continue
+                replaced_callouts.add(container_id)
+                container.replace_with(make_markdown_table_placeholder(table))
                 continue
             table.replace_with(make_markdown_table_placeholder(table))
 
@@ -351,6 +490,8 @@ def extract_lines_from_nodes(nodes, link_selector: str) -> list[str]:
                     plain = line.removeprefix(SUBSECTION_TITLE_PREFIX).strip()
                     if DID_YOU_KNOW_TITLE_RE.match(plain):
                         continue
+                    if is_excluded_subsection_title(plain):
+                        continue
                     previous_line = append_unique(lines, line, previous_line)
                 continue
 
@@ -358,6 +499,9 @@ def extract_lines_from_nodes(nodes, link_selector: str) -> list[str]:
             if line is None:
                 continue
             if DID_YOU_KNOW_TITLE_RE.match(line.strip()):
+                continue
+            plain = line.removeprefix(SUBSECTION_TITLE_PREFIX).strip()
+            if is_excluded_subsection_title(plain):
                 continue
             previous_line = append_unique(lines, line, previous_line)
     return lines
@@ -424,6 +568,16 @@ def remove_did_you_know_blocks(soup: BeautifulSoup) -> None:
         block.decompose()
 
 
+def remove_excluded_subsections(soup: BeautifulSoup) -> None:
+    for section in soup.select('section[class*="TopicHHead_topicHHeadSection"]'):
+        header = section.select_one("h2, h3")
+        if header is None:
+            continue
+        title = header.get_text(strip=True)
+        if is_excluded_subsection_title(title):
+            section.decompose()
+
+
 def write_lines(filepath: str, lines: list[str]) -> None:
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as output_file:
@@ -445,12 +599,14 @@ def get_data(
         pro_soup = BeautifulSoup(fetch_url(f"{BASE_URL}{pro_path}"), "html.parser")
         remove_reference_sections(pro_soup)
         remove_did_you_know_blocks(pro_soup)
+        remove_excluded_subsections(pro_soup)
         pro_lines = extract_target_sections(pro_soup, is_professional=True)
 
     if home_path:
         home_soup = BeautifulSoup(fetch_url(f"{BASE_URL}{home_path}"), "html.parser")
         remove_reference_sections(home_soup)
         remove_did_you_know_blocks(home_soup)
+        remove_excluded_subsections(home_soup)
         home_lines = extract_target_sections(home_soup, is_professional=False)
 
     if not pro_lines and not home_lines:
