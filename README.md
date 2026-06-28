@@ -67,7 +67,7 @@ This runs:
 | Symptoms and signs | Evaluation |
 | Evaluation | |
 
-* **Excluded from scraped text:** reference blocks (`References`, `General references`, inline `… reference` subsections), consumer **Did You Know** pearl callouts, and subsections titled **Physical examination**, **Interpretation of findings**, **Staging**, or **Screening**.
+* **Excluded from scraped text:** reference blocks (`References`, `General references`, inline `… reference` subsections), consumer **Did You Know** pearl callouts, and subsections titled **Physical examination**, **Interpretation of findings**, **Staging**, **Screening**, **Testing**, or **Tests**.
 * **Raw file format:** `#` page title, `##` section headings, `###` subsections; MSD tables and lists are converted to markdown-style lines.
 
 ### Sentence splitting (`sentence_split_rag_en.py`)

@@ -61,6 +61,8 @@ EXCLUDED_SUBSECTION_TITLE_RES = (
     re.compile(r"^interpretation of findings\b", re.IGNORECASE),
     re.compile(r"^staging\b", re.IGNORECASE),
     re.compile(r"^screening\b", re.IGNORECASE),
+    re.compile(r"^testing\b", re.IGNORECASE),
+    re.compile(r"^tests\b", re.IGNORECASE),
 )
 
 # Markdown-style prefixes so sentence split can keep headers on their own lines.
@@ -568,6 +570,11 @@ def remove_did_you_know_blocks(soup: BeautifulSoup) -> None:
         block.decompose()
 
 
+def remove_schema_only_duplicates(soup: BeautifulSoup) -> None:
+    for element in soup.select('span[class*="onlySchema"]'):
+        element.decompose()
+
+
 def remove_excluded_subsections(soup: BeautifulSoup) -> None:
     for section in soup.select('section[class*="TopicHHead_topicHHeadSection"]'):
         header = section.select_one("h2, h3")
@@ -599,6 +606,7 @@ def get_data(
         pro_soup = BeautifulSoup(fetch_url(f"{BASE_URL}{pro_path}"), "html.parser")
         remove_reference_sections(pro_soup)
         remove_did_you_know_blocks(pro_soup)
+        remove_schema_only_duplicates(pro_soup)
         remove_excluded_subsections(pro_soup)
         pro_lines = extract_target_sections(pro_soup, is_professional=True)
 
@@ -606,6 +614,7 @@ def get_data(
         home_soup = BeautifulSoup(fetch_url(f"{BASE_URL}{home_path}"), "html.parser")
         remove_reference_sections(home_soup)
         remove_did_you_know_blocks(home_soup)
+        remove_schema_only_duplicates(home_soup)
         remove_excluded_subsections(home_soup)
         home_lines = extract_target_sections(home_soup, is_professional=False)
 
